@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         AI网站公式复制Latex
 // @namespace    http://tampermonkey.net/
-// @version      0.8
+// @version      0.9
 // @description  支持Claude、DeepSeek、Google Gemini等网站的公式复制，包括点击复制、选择复制和按钮复制，格式化为$和$$包裹的LaTeX
-// @author       You
+// @license      MIT
+// @author       fanxing
 // @match        *://demo.fuclaude.oaifree.com/*
 // @match        *://claude.ai/*
 // @match        *://*.zhihu.com/*
@@ -397,6 +398,13 @@
                 }
             }
 
+            // 额外剥离 \( ... \) 与 \[ ... \] 定界，兼容豆包等站点
+            if ((input.startsWith('\\(') && input.endsWith('\\)')) ||
+                (input.startsWith('\\[') && input.endsWith('\\]'))) {
+                // \( ... \) 或 \[ ... \]
+                input = input.slice(2, -2).trim();
+            }
+
             // 根据显示模式添加适当的分隔符
             if (isDisplayMode) {
                 return '\n$$\n' + input + '\n$$\n';
@@ -455,6 +463,32 @@
             target.isDisplayMode = isDisplayModeFormula;
             return target;
         }
+        // 豆包
+        else if (url.includes('doubao.com')) {
+            target.elementSelector = 'span.container-rkuXQi, span.katex, span.math-inline, span.math-display';
+            target.getLatexString = (element) => {
+                // 优先从最近的容器读取 data-custom-copy-text（兼容事件绑定在 .katex 等子节点的情况）
+                const container = element.closest('.container-rkuXQi') || element;
+                const customCopyText = container.getAttribute('data-custom-copy-text') || element.getAttribute('data-custom-copy-text');
+                if (customCopyText) {
+                    // 显示模式：优先依据是否存在 .katex-display，其次依据容器/元素的行内/块级标记
+                    const isDisplay = !!(container.querySelector('.katex-display') || element.closest('.katex-display')) ||
+                                      container.classList.contains('math-display') ||
+                                      (!container.classList.contains('math-inline') && !element.classList.contains('math-inline'));
+                    return formatLatex(customCopyText, isDisplay);
+                }
+                
+                // 回退到标准annotation方法
+                const annotation = element.querySelector('annotation[encoding="application/x-tex"]');
+                const isDisplay = isDisplayModeFormula(element);
+                return annotation ? formatLatex(annotation.textContent, isDisplay) : null;
+            };
+            target.isDisplayMode = (element) => !!(element.querySelector && element.querySelector('.katex-display')) ||
+                                               !!element.closest('.katex-display') ||
+                                               element.classList.contains('math-display') ||
+                                               !element.classList.contains('math-inline');
+            return target;
+        }
         // 知乎
         else if (url.includes('zhihu.com')) {
             target.elementSelector = 'span.ztext-math';
@@ -496,8 +530,8 @@
     function processFormulaFromElement(element) {
         console.log('开始处理元素中的公式');
 
-        // 找出所有KaTeX公式，包括Google AI Studio的ms-katex
-        const allFormulas = element.querySelectorAll('.katex, .math-inline, .math-display, .katex-display, ms-katex');
+        // 找出所有KaTeX公式，包括Google AI Studio的ms-katex和豆包的container-rkuXQi
+        const allFormulas = element.querySelectorAll('.katex, .math-inline, .math-display, .katex-display, ms-katex, .container-rkuXQi');
         console.log(`找到 ${allFormulas.length} 个公式元素`);
 
         // 打印找到的公式元素信息
@@ -513,26 +547,40 @@
         allFormulas.forEach((formula, index) => {
             try {
                 console.log(`处理公式 ${index + 1}`);
-                // 查找公式的LaTeX内容
-                const annotation = formula.querySelector('annotation[encoding="application/x-tex"]');
+                
+                let latexContent = null;
+                let isDisplayMode = false;
+                
+                // 豆包：优先使用data-custom-copy-text属性
+                const customCopyText = formula.getAttribute('data-custom-copy-text');
+                if (customCopyText) {
+                    latexContent = customCopyText;
+                    isDisplayMode = formula.classList.contains('math-display') || 
+                                   !formula.classList.contains('math-inline');
+                } else {
+                    // 其他网站：查找annotation元素
+                    const annotation = formula.querySelector('annotation[encoding="application/x-tex"]');
+                    if (annotation && annotation.textContent) {
+                        latexContent = annotation.textContent;
+                        // 判断是否是公式块
+                        isDisplayMode = formula.classList.contains('math-display') ||
+                                      formula.classList.contains('katex-display') ||
+                                      formula.closest('.math-display') !== null ||
+                                      formula.closest('.katex-display') !== null ||
+                                      formula.closest('.ds-markdown-math') !== null ||
+                                      (formula.tagName === 'MS-KATEX' && !formula.classList.contains('inline')) ||
+                                      (formula.closest('ms-katex') && !formula.closest('ms-katex').classList.contains('inline'));
+                    }
+                }
 
                 // 如果找到了LaTeX内容
-                if (annotation && annotation.textContent) {
-                    // 判断是否是公式块
-                    const isDisplayMode = formula.classList.contains('math-display') ||
-                                          formula.classList.contains('katex-display') ||
-                                          formula.closest('.math-display') !== null ||
-                                          formula.closest('.katex-display') !== null ||
-                                          formula.closest('.ds-markdown-math') !== null ||
-                                          (formula.tagName === 'MS-KATEX' && !formula.classList.contains('inline')) ||
-                                          (formula.closest('ms-katex') && !formula.closest('ms-katex').classList.contains('inline'));
-
+                if (latexContent) {
                     // 创建替换内容
                     let replacementText;
                     if (isDisplayMode) {
-                        replacementText = '\n$$\n' + annotation.textContent.trim() + '\n$$\n';
+                        replacementText = '\n$$\n' + latexContent.trim() + '\n$$\n';
                     } else {
-                        replacementText = '$' + annotation.textContent.trim() + '$';
+                        replacementText = '$' + latexContent.trim() + '$';
                     }
 
                     // 替换公式元素
@@ -546,6 +594,8 @@
                         targetNode = formula.closest('.math-display');
                     } else if (formula.closest('.ds-markdown-math')) {
                         targetNode = formula.closest('.ds-markdown-math');
+                    } else if (formula.closest('.container-rkuXQi')) {
+                        targetNode = formula.closest('.container-rkuXQi');
                     } else if (formula.tagName === 'MS-KATEX') {
                         targetNode = formula;
                     } else if (formula.closest('ms-katex')) {
@@ -624,6 +674,10 @@
                 // Gemini：检查hook数据
                 const katexHtml = element.classList.contains('katex-html') ? element : element.querySelector('.katex-html');
                 hasValidLatex = katexHtml && allKatexGemini[katexHtml.outerHTML];
+            } else if (window.location.href.includes('doubao.com')) {
+                // 豆包：检查data-custom-copy-text属性
+                hasValidLatex = !!element.getAttribute('data-custom-copy-text') || 
+                               !!element.querySelector('annotation[encoding="application/x-tex"]');
             } else {
                 // 其他网站：检查annotation元素
                 const annotation = element.querySelector('annotation[encoding="application/x-tex"]');
@@ -729,7 +783,7 @@
         tempDiv.appendChild(fragment.cloneNode(true));
 
         // 直接在DOM中检测公式元素
-        const formulaElements = tempDiv.querySelectorAll('.katex, .math-inline, .math-display, .katex-display, ms-katex, .katex-html');
+        const formulaElements = tempDiv.querySelectorAll('.katex, .math-inline, .math-display, .katex-display, ms-katex, .katex-html, .container-rkuXQi');
         const hasFormula = formulaElements.length > 0;
 
         console.log('找到公式元素数量:', formulaElements.length);
@@ -808,23 +862,30 @@
             try {
                 const text = await navigator.clipboard.readText();
 
-                if (text.includes('$$')) {
-                    console.log('检测到按钮复制的公式，正在格式化...');
+                // 统一规范化三种常见定界：$$...$$, \[...\], \(...\)
+                let modifiedText = text;
+                let matchCount = 0;
 
-                    // 正则表达式匹配所有的 $$ 公式内容 $$ 格式
-                    const formulaRegex = /\$\$(.*?)\$\$/gs;
-                    let matchCount = 0;
+                // $$...$$ → 换行块级
+                modifiedText = modifiedText.replace(/\$\$(.*?)\$\$/gs, (m, f) => {
+                    matchCount++;
+                    return `\n$$\n${f.trim()}\n$$\n`;
+                });
 
-                    // 替换为换行格式
-                    const modifiedText = text.replace(formulaRegex, function(match, formula) {
-                        matchCount++;
-                        const trimmedFormula = formula.trim();
-                        return '\n$$\n' + trimmedFormula + '\n$$\n';
-                    });
+                // \[...\] → 换行块级（避免与 $$ 已替换的重复，这里直接处理剩余）
+                modifiedText = modifiedText.replace(/\\\[(.*?)\\\]/gs, (m, f) => {
+                    matchCount++;
+                    return `\n$$\n${f.trim()}\n$$\n`;
+                });
 
-                    // 设置修改后的内容到剪贴板
+                // \(...\) → 行内
+                modifiedText = modifiedText.replace(/\\\((.*?)\\\)/gs, (m, f) => {
+                    matchCount++;
+                    return `$${f.trim()}$`;
+                });
+
+                if (matchCount > 0) {
                     const success = await setClipboardToPlainText(modifiedText);
-
                     if (success) {
                         showToast(`已格式化 ${matchCount} 个公式`, 'success');
                     } else {
@@ -851,6 +912,18 @@
                     button.removeEventListener('click', handleButtonClick);
                     button.addEventListener('click', handleButtonClick);
                 });
+            }
+        }
+
+        // 豆包特定按钮
+        if (window.location.href.includes('doubao.com')) {
+            const doubaoButtons = document.querySelectorAll('button[data-testid="message_action_copy"]');
+            if (doubaoButtons.length > 0) {
+                doubaoButtons.forEach(button => {
+                    button.removeEventListener('click', handleButtonClick);
+                    button.addEventListener('click', handleButtonClick);
+                });
+                console.log(`找到 ${doubaoButtons.length} 个豆包复制按钮，添加监听器`);
             }
         }
 
@@ -962,9 +1035,9 @@
     // 添加调试辅助函数
     window.debugFormulaScript = function() {
         console.log('=== 公式复制脚本调试信息 ===');
-        console.log('脚本版本: 0.8 (Google Gemini 专项适配版)');
+        console.log('脚本版本: 0.9 (豆包网站新增支持)');
         console.log('当前网站:', window.location.href);
-        console.log('支持的网站:', ['Claude', 'DeepSeek', '知乎', 'Google AI Studio', 'Google Gemini', '等等']);
+        console.log('支持的网站:', ['Claude', 'DeepSeek', '知乎', 'Google AI Studio', 'Google Gemini', '豆包', '等等']);
 
         const target = getTarget(window.location.href);
         console.log('当前网站配置:', target);
@@ -996,6 +1069,24 @@
             });
         }
 
+        // 豆包特殊调试信息
+        if (window.location.href.includes('doubao.com')) {
+            console.log('=== 豆包特殊调试信息 ===');
+            const doubaoContainers = document.querySelectorAll('.container-rkuXQi');
+            console.log(`找到 ${doubaoContainers.length} 个豆包公式容器`);
+            const copyButtons = document.querySelectorAll('button[data-testid="message_action_copy"]');
+            console.log(`找到 ${copyButtons.length} 个豆包复制按钮`);
+            
+            // 显示豆包公式的data-custom-copy-text属性
+            console.log('豆包公式data-custom-copy-text属性:');
+            doubaoContainers.forEach((container, index) => {
+                const customText = container.getAttribute('data-custom-copy-text');
+                if (customText) {
+                    console.log(`  ${index + 1}. ${customText}`);
+                }
+            });
+        }
+
         console.log('如果复制不工作，请检查浏览器控制台的错误信息');
         console.log('=== 调试信息结束 ===');
     };
@@ -1014,6 +1105,13 @@
     if (window.location.href.includes('gemini.google.com')) {
         setTimeout(() => {
             showToast('Google Gemini适配已启用，支持动态加载内容，控制台输入debugFormulaScript()查看调试信息', 'info', 4000);
+        }, 2500);
+    }
+
+    // 如果是豆包，显示特殊提示
+    if (window.location.href.includes('doubao.com')) {
+        setTimeout(() => {
+            showToast('豆包适配已启用，支持data-custom-copy-text属性，控制台输入debugFormulaScript()查看调试信息', 'info', 4000);
         }, 2500);
     }
 })();
